@@ -1,13 +1,65 @@
-//! egui-based GUI for real-time candlestick charting.
+//! egui-based GUI: candlestick chart, watchlist, live option chain and paper trading.
 //! Pure egui implementation with no Tauri dependencies.
 
-use std::sync::mpsc::{Receiver};
+use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_plot::{BoxElem, BoxPlot, BoxSpread, HPlacement, Plot, PlotPoint};
 use serde::{Deserialize, Serialize};
 use tracing::info;
+
+pub mod backend;
+mod options;
+mod paper;
+mod watchlist;
+
+use crate::storage::OptionTickRow;
+use backend::{Backend, Db, DbMsg};
+use options::{ChainStore, ChainView, Contract};
+use paper::{PaperAction, Ticket};
+use watchlist::{WatchlistState, WlAction};
+
+/// Everything the backend streams to the UI.
+pub enum GuiEvent {
+    Index(IndexTickRow),
+    Option(OptionTickRow),
+}
+
+/// Latest price + change for any instrument (used by watchlist and paper trading).
+pub struct QuoteView {
+    pub price: f64,
+    pub change: Option<f64>,
+    /// `true` if `change` is a percentage (indices), `false` if absolute (options).
+    pub pct: bool,
+}
+
+struct Quote {
+    price: f64,
+    per_change: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Chart,
+    Options,
+    Paper,
+}
+
+fn price_lookup(
+    quotes: &HashMap<String, Quote>,
+    chain: &ChainStore,
+    kind: &str,
+    symbol: &str,
+) -> Option<QuoteView> {
+    if kind == "option" {
+        let c = Contract::parse(symbol)?;
+        chain.quote(&c).map(|(price, change)| QuoteView { price, change, pct: false })
+    } else {
+        quotes.get(symbol).map(|q| QuoteView { price: q.price, change: Some(q.per_change), pct: true })
+    }
+}
 
 /// Matches `IndexTickRow` from storage::ticks
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,10 +136,17 @@ impl CandleSeries {
 /// Main chart application
 pub struct CandlestickApp {
     series: CandleSeries,
-    tick_rx: Receiver<IndexTickRow>,
-    start: Instant,
-    last_tick_at: Instant,
-    tick_interval: Duration,
+    tick_rx: Receiver<GuiEvent>,
+    backend_rx: Receiver<Backend>,
+    db: Db,
+    tab: Tab,
+    quotes: HashMap<String, Quote>,
+    chain: ChainStore,
+    chain_view: ChainView,
+    watchlist: WatchlistState,
+    ticket: Ticket,
+    trades: Vec<crate::storage::paper_trades::PaperTrade>,
+    status_error: Option<String>,
     frame_times: Vec<f32>,
     last_frame_at: Instant,
     tick_count: u64,
@@ -99,14 +158,21 @@ pub struct CandlestickApp {
 }
 
 impl CandlestickApp {
-    pub fn new(tick_rx: Receiver<IndexTickRow>) -> Self {
+    pub fn new(tick_rx: Receiver<GuiEvent>, backend_rx: Receiver<Backend>) -> Self {
         let now = Instant::now();
         Self {
             series: CandleSeries::new(1),
             tick_rx,
-            start: now,
-            last_tick_at: now,
-            tick_interval: Duration::from_millis(20),
+            backend_rx,
+            db: Db::new(),
+            tab: Tab::Chart,
+            quotes: HashMap::new(),
+            chain: ChainStore::default(),
+            chain_view: ChainView::default(),
+            watchlist: WatchlistState::default(),
+            ticket: Ticket::default(),
+            trades: Vec::new(),
+            status_error: None,
             frame_times: Vec::with_capacity(240),
             last_frame_at: now,
             tick_count: 0,
@@ -119,73 +185,149 @@ impl CandlestickApp {
     }
 
     fn process_pending_ticks(&mut self) {
-        info!("start: {:?}\nlast_tick_at: {:?}\ntick_interval: {:?}", self.start, self.last_tick_at, self.tick_interval);
-        while let Ok(tick) = self.tick_rx.try_recv() {
-            // Skip heartbeats
-            if tick.index_name == "HEARTBEAT" {
-                continue;
+        while let Ok(ev) = self.tick_rx.try_recv() {
+            match ev {
+                GuiEvent::Index(tick) => {
+                    // Skip heartbeats
+                    if tick.index_name == "HEARTBEAT" {
+                        continue;
+                    }
+
+                    self.quotes.insert(
+                        tick.index_name.clone(),
+                        Quote { price: tick.current_price, per_change: tick.per_change },
+                    );
+                    self.connection_status = "Connected".to_string();
+                    self.error_message = None;
+
+                    // Only the selected index feeds the candle series
+                    if tick.index_name == self.selected_index {
+                        let elapsed = self.tick_count as f64 * 0.02;
+                        self.series.push_tick(elapsed, tick.current_price);
+                        self.tick_count += 1;
+                    }
+                }
+                GuiEvent::Option(row) => self.chain.apply(row),
             }
+        }
+    }
 
-            // Only process ticks for the selected index
-            if tick.index_name != self.selected_index {
-                continue;
+    fn poll_backend(&mut self) {
+        if let Ok(backend) = self.backend_rx.try_recv() {
+            self.db.set_backend(backend);
+            self.db.refresh_watchlists();
+            self.db.refresh_trades();
+        }
+    }
+
+    fn process_db_msgs(&mut self) {
+        while let Ok(msg) = self.db.rx.try_recv() {
+            match msg {
+                DbMsg::Watchlists(lists) => {
+                    let still_valid = self.watchlist.selected.map_or(false, |id| lists.iter().any(|l| l.id == id));
+                    if !still_valid {
+                        self.watchlist.selected = lists.first().map(|l| l.id);
+                        self.watchlist.items.clear();
+                        if let Some(id) = self.watchlist.selected {
+                            self.db.refresh_items(id);
+                        }
+                    }
+                    self.watchlist.lists = lists;
+                }
+                DbMsg::Items { watchlist_id, items } => {
+                    if Some(watchlist_id) == self.watchlist.selected {
+                        self.watchlist.items = items;
+                    }
+                }
+                DbMsg::Trades(t) => self.trades = t,
+                DbMsg::Error(e) => self.status_error = Some(e),
             }
+        }
+    }
 
-            let elapsed = self.tick_count as f64 * 0.02;
-            self.series.push_tick(elapsed, tick.current_price);
-            self.tick_count += 1;
+    fn select_index(&mut self, name: &str) {
+        if self.selected_index != name {
+            self.selected_index = name.to_string();
+            self.series = CandleSeries::new(1);
+            self.tick_count = 0;
+            self.follow = true;
+        }
+    }
 
-            self.connection_status = "Connected".to_string();
-            self.error_message = None;
+    fn index_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.quotes.keys().cloned().collect();
+        if v.is_empty() {
+            v.push(self.selected_index.clone());
+        }
+        v.sort();
+        v
+    }
+
+    fn handle_watchlist_action(&mut self, a: WlAction) {
+        match a {
+            WlAction::SelectList(id) => {
+                self.watchlist.selected = Some(id);
+                self.watchlist.items.clear();
+                self.db.refresh_items(id);
+            }
+            WlAction::Create(name) => self.db.create_watchlist(name),
+            WlAction::Delete(id) => self.db.delete_watchlist(id),
+            WlAction::Add { symbol, kind } => {
+                if let Some(id) = self.watchlist.selected {
+                    self.db.add_item(id, symbol, kind);
+                }
+            }
+            WlAction::Remove(item_id) => {
+                if let Some(id) = self.watchlist.selected {
+                    self.db.remove_item(id, item_id);
+                }
+            }
+            WlAction::Open(item) => {
+                if item.instrument_type == "option" {
+                    self.ticket.instrument_type = "option".into();
+                    self.ticket.symbol = item.symbol;
+                    self.tab = Tab::Paper;
+                } else {
+                    self.select_index(&item.symbol);
+                    self.ticket.instrument_type = "index".into();
+                    self.ticket.symbol = item.symbol;
+                    self.tab = Tab::Chart;
+                }
+            }
+        }
+    }
+
+    fn handle_paper_action(&mut self, a: PaperAction) {
+        match a {
+            PaperAction::Open { symbol, kind, side, qty, price, notes } => {
+                self.db.open_trade(symbol, kind, side, qty, price, notes)
+            }
+            PaperAction::Close { id, price } => self.db.close_trade(id, price),
+            PaperAction::AddToWatchlist { symbol, kind } => {
+                if let Some(id) = self.watchlist.selected {
+                    self.db.add_item(id, symbol, kind);
+                }
+            }
         }
     }
 }
 
-impl eframe::App for CandlestickApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        // Process pending ticks
-        self.process_pending_ticks();
-
-        // Frame timing
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_at).as_secs_f32();
-        self.last_frame_at = now;
-        if dt > 0.0 {
-            self.frame_times.push(dt);
-            if self.frame_times.len() > 120 {
-                self.frame_times.remove(0);
-            }
-        }
-        let avg_dt = if self.frame_times.is_empty() {
-            0.0
-        } else {
-            self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32
-        };
-        let fps = if avg_dt > 0.0 { 1.0 / avg_dt } else { 0.0 };
-
-        ui.heading("kstocks: egui candlestick chart");
-
+impl CandlestickApp {
+    fn chart_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let status_color = match self.connection_status.as_str() {
-                "Connected" => egui::Color32::GREEN,
-                "Connecting" => egui::Color32::YELLOW,
-                "Disconnected" => egui::Color32::RED,
-                _ => egui::Color32::GRAY,
-            };
-
-            ui.colored_label(status_color, format!("● {}", self.connection_status));
-            ui.separator();
-            ui.label(format!("Index: {}", self.selected_index));
-            ui.separator();
-            ui.label(format!(
-                "bars: {} | ticks: {} | fps: {:.1} | frame: {:.2}ms",
-                self.series.bars.len(),
-                self.tick_count,
-                fps,
-                avg_dt * 1000.0
-            ));
+            ui.label("Index:");
+            let names = self.index_names();
+            let mut chosen = self.selected_index.clone();
+            egui::ComboBox::from_id_salt("chart_index")
+                .selected_text(&chosen)
+                .show_ui(ui, |ui| {
+                    for n in &names {
+                        ui.selectable_value(&mut chosen, n.clone(), n);
+                    }
+                });
+            if chosen != self.selected_index {
+                self.select_index(&chosen);
+            }
         });
 
         if let Some(ref err) = self.error_message {
@@ -333,13 +475,125 @@ impl eframe::App for CandlestickApp {
             );
         }
 
+    }
+}
+
+impl eframe::App for CandlestickApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        self.poll_backend();
+        self.process_pending_ticks();
+        self.process_db_msgs();
+
+        // Frame timing
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_at).as_secs_f32();
+        self.last_frame_at = now;
+        if dt > 0.0 {
+            self.frame_times.push(dt);
+            if self.frame_times.len() > 120 {
+                self.frame_times.remove(0);
+            }
+        }
+        let avg_dt = if self.frame_times.is_empty() {
+            0.0
+        } else {
+            self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32
+        };
+        let fps = if avg_dt > 0.0 { 1.0 / avg_dt } else { 0.0 };
+
+        // ---- top bar ------------------------------------------------------
+        egui::Panel::top("top_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("kstocks");
+                ui.separator();
+                ui.selectable_value(&mut self.tab, Tab::Chart, "Chart");
+                ui.selectable_value(&mut self.tab, Tab::Options, "Options");
+                ui.selectable_value(&mut self.tab, Tab::Paper, "Paper Trading");
+            });
+            ui.horizontal(|ui| {
+                let status_color = match self.connection_status.as_str() {
+                    "Connected" => egui::Color32::GREEN,
+                    "Connecting" => egui::Color32::YELLOW,
+                    "Disconnected" => egui::Color32::RED,
+                    _ => egui::Color32::GRAY,
+                };
+                ui.colored_label(status_color, format!("● {}", self.connection_status));
+                ui.separator();
+                ui.label(format!(
+                    "bars: {} | ticks: {} | opt ticks: {} | fps: {:.1} | frame: {:.2}ms",
+                    self.series.bars.len(),
+                    self.tick_count,
+                    self.chain.tick_count,
+                    fps,
+                    avg_dt * 1000.0
+                ));
+                if let Some(err) = self.status_error.clone() {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::RED, format!("DB: {err}"));
+                    if ui.small_button("dismiss").clicked() {
+                        self.status_error = None;
+                    }
+                }
+            });
+        });
+
+        // ---- watchlist side panel -----------------------------------------
+        let index_names = self.index_names();
+        let mut wl_actions: Vec<WlAction> = Vec::new();
+        egui::Panel::left("watchlist_panel")
+            .default_size(270.0)
+            .show(ui, |ui| {
+                wl_actions = watchlist::show(ui, &mut self.watchlist, &index_names, &|kind, sym| {
+                    price_lookup(&self.quotes, &self.chain, kind, sym)
+                });
+            });
+
+        // ---- central area -------------------------------------------------
+        let mut chain_pick: Option<Contract> = None;
+        let mut paper_actions: Vec<PaperAction> = Vec::new();
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            Tab::Chart => self.chart_ui(ui),
+            Tab::Options => {
+                let quotes = &self.quotes;
+                chain_pick = options::show(ui, &mut self.chain_view, &self.chain, &|sym| {
+                    options::spot_index_name(sym).and_then(|n| quotes.get(n)).map(|q| q.price)
+                });
+            }
+            Tab::Paper => {
+                paper_actions = paper::show(
+                    ui,
+                    &mut self.ticket,
+                    &self.trades,
+                    &index_names,
+                    &|kind, sym| price_lookup(&self.quotes, &self.chain, kind, sym),
+                    self.db.is_ready(),
+                    self.watchlist.selected.is_some(),
+                );
+            }
+        });
+
+        // ---- apply deferred actions ---------------------------------------
+        if let Some(c) = chain_pick {
+            self.ticket.instrument_type = "option".into();
+            self.ticket.symbol = c.key();
+            self.tab = Tab::Paper;
+        }
+        for a in wl_actions {
+            self.handle_watchlist_action(a);
+        }
+        for a in paper_actions {
+            self.handle_paper_action(a);
+        }
+
         ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
 
 /// Create an app instance with a tick receiver
-pub fn create_app(tick_rx: Receiver<IndexTickRow>) -> CandlestickApp {
-    CandlestickApp::new(tick_rx)
+pub fn create_app(tick_rx: Receiver<GuiEvent>, backend_rx: Receiver<Backend>) -> CandlestickApp {
+    CandlestickApp::new(tick_rx, backend_rx)
 }
 
 /// Run the egui application (called from gui_runner on the main thread)

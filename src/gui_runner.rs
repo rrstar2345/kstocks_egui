@@ -7,20 +7,22 @@ use std::sync::mpsc::channel;
 use tracing::info;
 
 use crate::gui;
-use crate::gui::IndexTickRow as GuiIndexTickRow;
+use crate::gui::backend::Backend;
+use crate::gui::{GuiEvent, IndexTickRow as GuiIndexTickRow};
 use crate::market::{market_clock, streamers, symbols, events::EventEmitter};
 use crate::storage::{self, IndexTickRow};
 use crate::{api, settings, stats};
 
 /// Run the full hybrid app: initialize backend async, then run egui on main thread
 pub fn run() {
-    let (tx, rx) = channel::<GuiIndexTickRow>();
+    let (tx, rx) = channel::<GuiEvent>();
+    let (ready_tx, ready_rx) = channel::<Backend>();
 
     // Spawn backend initialization in a dedicated background thread
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
-            if let Err(e) = init_backend_with_ticks(tx).await {
+            if let Err(e) = init_backend_with_ticks(tx, ready_tx).await {
                 eprintln!("Backend initialization error: {}", e);
             }
 
@@ -36,13 +38,14 @@ pub fn run() {
     info!("Backend initialized, starting egui GUI");
 
     // Run egui on main thread (required for X11/Wayland/Windows event loops)
-    let app = gui::create_app(rx);
+    let app = gui::create_app(rx, ready_rx);
     gui::run_app(app);
 }
 
 /// Initialize the backend: DB, streamers, aggregation, retention
 async fn init_backend_with_ticks(
-    gui_tx: std::sync::mpsc::Sender<GuiIndexTickRow>,
+    gui_tx: std::sync::mpsc::Sender<GuiEvent>,
+    ready_tx: std::sync::mpsc::Sender<Backend>,
 ) -> anyhow::Result<()> {
     let app_settings = settings::setup_app_folders()?;
     let config = settings::load_or_create_config(&app_settings)?;
@@ -53,6 +56,12 @@ async fn init_backend_with_ticks(
 
     let db = storage::init_pool(&config.database).await?;
     info!("SQLite connected and schema verified");
+
+    // Hand the pool + runtime handle to the UI (watchlists / paper trades)
+    let _ = ready_tx.send(Backend {
+        pool: db.clone(),
+        rt: tokio::runtime::Handle::current(),
+    });
 
     let app_stats = stats::new_shared_stats();
     let session = market_clock::new_shared_session_state();
@@ -171,13 +180,13 @@ async fn init_backend_with_ticks(
 /// Replaces Tauri's AppHandle for the egui standalone app
 #[derive(Clone)]
 pub struct GuiEventEmitter {
-    tx: std::sync::mpsc::Sender<GuiIndexTickRow>,
+    tx: std::sync::mpsc::Sender<GuiEvent>,
 }
 
 impl GuiEventEmitter {
-    /// Emit a tick row to the GUI
-    pub fn emit_tick(&self, tick: GuiIndexTickRow) {
-        let _ = self.tx.send(tick);
+    /// Emit an event to the GUI
+    pub fn emit(&self, ev: GuiEvent) {
+        let _ = self.tx.send(ev);
     }
 }
 
@@ -198,10 +207,10 @@ impl EventEmitter for GuiEventEmitter {
             mkt_status: row.mkt_status.clone(),
             dissemination_time: row.dissemination_time.clone(),
         };
-        let _ = self.tx.send(gui_row);
+        let _ = self.tx.send(GuiEvent::Index(gui_row));
     }
 
-    fn emit_option_tick(&self, _row: &storage::OptionTickRow) {
-        // TODO: Option streaming to GUI
+    fn emit_option_tick(&self, row: &storage::OptionTickRow) {
+        let _ = self.tx.send(GuiEvent::Option(row.clone()));
     }
 }
