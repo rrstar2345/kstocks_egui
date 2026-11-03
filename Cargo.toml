@@ -1,15 +1,10 @@
 [package]
 name = "kstocks"
 version = "0.1.0"
-description = "KSTOCKS Client - Standalone egui Desktop App"
+description = "KSTOCKS standalone Rust + egui desktop app"
 edition = "2021"
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dependencies]
-tauri = { version = "2", features = [] }
-
 # Core egui GUI
 eframe = "0.36"
 egui = "0.36"
